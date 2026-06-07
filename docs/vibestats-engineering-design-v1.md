@@ -163,7 +163,8 @@ CREATE TABLE scan_jobs (
   api_calls_used INTEGER DEFAULT 0,
   cache_hit BOOLEAN DEFAULT FALSE,
   retry_count INTEGER DEFAULT 0,
-  next_retry_at TIMESTAMPTZ
+  next_retry_at TIMESTAMPTZ,
+  progress_json JSONB -- {"stage": "fetching_commits", "percent_complete": 45}
 );
 
 CREATE INDEX idx_scan_jobs_status ON scan_jobs(status);
@@ -171,19 +172,49 @@ CREATE INDEX idx_scan_jobs_repo ON scan_jobs(repo_id);
 CREATE INDEX idx_scan_jobs_next_retry ON scan_jobs(next_retry_at) WHERE status = 'pending';
 ```
 
-**Purpose:** Track scan job lifecycle, retries, and errors.
+**Purpose:** Track scan job lifecycle, retries, and progress.
 
-**State Machine:**
-```
-pending → running → completed
-              ↓
-            failed → pending (retry)
+**Progress JSON Schema:**
+```typescript
+{
+  stage: "validate" | "check_cache" | "fetch_metadata" | "fetch_timeline" | "aggregate" | "complete",
+  percent_complete: number,
+  current_entity?: "commits" | "prs" | "issues" | "releases"
+}
 ```
 
-**Retry Logic:**
-- Max 3 retries
-- Exponential backoff: 1min, 5min, 30min
-- `next_retry_at` indexed for efficient polling
+---
+
+#### `disputes`
+
+```sql
+CREATE TABLE disputes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  repo_id UUID REFERENCES repositories(id) ON DELETE CASCADE,
+  issue_type TEXT NOT NULL, -- incorrect_data, missing_data, unfair_interpretation, takedown_request
+  description TEXT NOT NULL,
+  evidence_url TEXT,
+  contact_email TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'submitted', -- submitted, under_review, resolved, closed
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  reviewed_at TIMESTAMPTZ,
+  reviewed_by TEXT,
+  resolution_notes TEXT,
+  resolved_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_disputes_status ON disputes(status);
+CREATE INDEX idx_disputes_repo ON disputes(repo_id);
+CREATE INDEX idx_disputes_created ON disputes(created_at DESC);
+```
+
+**Purpose:** Track maintainer dispute/correction requests.
+
+**Workflow:**
+1. Maintainer submits form → `status = 'submitted'`
+2. VibeStats team reviews → `status = 'under_review'`
+3. Resolution (correct/annotate/remove) → `status = 'resolved'`
+4. Respond to maintainer → `status = 'closed'`
 
 #### `scan_cache`
 
@@ -895,29 +926,100 @@ Implementation: Vercel middleware + Redis counter
 
 ---
 
-## 10. Open Technical Decisions
+## 12. Environment Variables
 
-1. **Background Job Execution:**
-   - Option A: Vercel cron + serverless functions
-   - Option B: GitHub Actions scheduled workflow
-   - Option C: Dedicated worker server (Fly.io, Railway)
-   - **Decision:** Start with Vercel cron, migrate if needed
+### Required
 
-2. **Database Migrations:**
-   - Option A: Supabase Dashboard manual
-   - Option B: Drizzle ORM migrations
-   - Option C: Prisma migrations
-   - **Decision:** Drizzle for type safety + version control
+| Variable | Description | Example |
+|----------|-------------|--------|
+| `GITHUB_TOKEN` | GitHub OAuth token (bot account) | `ghp_xxxx` |
+| `SUPABASE_URL` | Supabase project URL | `https://xxxx.supabase.co` |
+| `SUPABASE_KEY` | Supabase anon/public key | `eyJxxx` |
+| `SUPABASE_SERVICE_KEY` | Supabase service role key (for migrations) | `eyJxxx` |
+| `UPSTASH_REDIS_URL` | Upstash Redis URL | `https://xxxx.upstash.io` |
+| `UPSTASH_REDIS_TOKEN` | Upstash Redis token | `xxxx` |
+| `NODE_ENV` | Environment | `development`, `production` |
 
-3. **Chart Library:**
-   - Option A: Recharts (React-native, simple)
-   - Option B: ECharts (feature-rich, heavier)
-   - Option C: Chart.js (middle ground)
-   - **Decision:** Recharts for MVP simplicity
+### Optional
+
+| Variable | Description | Default |
+|----------|-------------|--------|
+| `RATE_LIMIT_PER_IP` | Scans per hour per IP | `5` |
+| `SCAN_CONCURRENCY` | Max concurrent scan jobs | `10` |
+| `CACHE_TTL_SECONDS` | API cache TTL | `86400` (24h) |
 
 ---
 
-## 11. Next Steps
+## 13. Data Retention Policy
+
+| Data Type | Retention | Rationale |
+|-----------|-----------|----------|
+| Raw API cache (`scan_cache`) | 24 hours | Reduces API calls, stale data OK |
+| Aggregated metrics (`weekly_metrics`) | Indefinite | Core historical data, low storage cost |
+| Daily snapshots (`daily_snapshots`) | 12 months | Point-in-time reference, can prune after 1 year |
+| Scan job history (`scan_jobs`) | 90 days | Debugging/auditing, old jobs less relevant |
+| Dispute records (`disputes`) | 2 years | Compliance, audit trail |
+
+---
+
+## 14. Worker Execution Model
+
+**Decision:** GitHub Actions scheduled workflow (not Vercel cron).
+
+**Rationale:**
+- Vercel serverless timeout: 60s (Hobby/Pro), insufficient for large repo scans
+- GitHub Actions: 6-hour timeout, better for long-running scans
+- No additional cost (free tier: 2,000 minutes/month)
+- Native GitHub API integration (no CORS, no external calls from client)
+
+**Implementation:**
+
+```yaml
+# .github/workflows/scan-worker.yml
+name: Scan Worker
+on:
+  schedule:
+    - cron: '* * * * *'  # Every minute
+  workflow_dispatch:
+
+jobs:
+  process-scans:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v1
+      - name: Process pending scans
+        run: bun scripts/process-scans.ts
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+**Polling Logic:**
+- Query `scan_jobs` WHERE `status = 'pending'` ORDER BY `created_at` LIMIT 10
+- Process each job, update `status = 'running'`, then `completed` or `failed`
+- On failure with retries remaining: `status = 'pending'`, `next_retry_at = NOW() + INTERVAL`
+
+---
+
+## 15. Timezone Handling
+
+**All date aggregations use UTC.**
+
+- `week_start`: Monday 00:00:00 UTC
+- `observed_at`: Midnight UTC
+- Scan timestamps: ISO 8601 with timezone
+
+**Rationale:**
+- Consistent across all repos regardless of owner location
+- GitHub API returns dates in UTC
+- Avoids DST complications
+
+---
+
+## 16. Next Steps
 
 1. **Create Database Schema** - Write SQL migrations
 2. **Set Up Project Repo** - Monorepo structure
